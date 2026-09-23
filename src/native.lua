@@ -1,32 +1,19 @@
 local ffi = require("ffi")
 
---- Finds a shared library the way require would, by walking package.cpath.
----@param name string
----@return string? path
-local function findLibrary(name)
-	local modulePath = name:gsub("%.", "/")
+local here = debug.getinfo(1, "S").source:sub(2):match("(.*[/\\])") or ""
 
-	for template in package.cpath:gmatch("[^;]+") do
-		local path = template:gsub("%?", modulePath)
-		local file = io.open(path, "rb")
-		if file then
-			file:close()
-			return path
-		end
-	end
-
-	return nil
-end
-
---- The decoders build.lua compiles: dr_mp3, libogg, libopus and libopusfile.
+--- The decoders build.lua compiles: dr_mp3, dr_flac, libogg, libopus and
+--- libopusfile in one library.
 ---@class treble.native
 ---@field path string
 ---@field lib ffi.namespace*
 local native = {}
 
-local path = findLibrary("treble.decoders")
-if path == nil then
-	error("The native decoders are missing. Run `lde install` to build them from build.lua.")
+local libname = jit.os == "Windows" and "decoders.dll" or "decoders.so"
+local path = here .. libname
+
+if io.open(path, "rb") == nil then
+	error("The native decoders are missing from " .. here .. ". Run `lde install` to build them from build.lua.")
 end
 
 native.path = path

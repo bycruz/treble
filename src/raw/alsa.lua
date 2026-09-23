@@ -35,7 +35,19 @@ ffi.cdef([[
 
 -- The versioned name is what the runtime ships; the unversioned "asound" only
 -- exists when the development package is installed.
-local asound = ffi.load("asound.so.2")
+--
+-- Android has no libasound whatsoever, so a missing library is reported when
+-- playback is asked for rather than making the module fail to load: every other
+-- part of the library still works there.
+---@type ffi.namespace*?
+local asound = nil
+
+do
+	local isLoaded, library = pcall(ffi.load, "asound.so.2")
+	if isLoaded then
+		asound = library
+	end
+end
 
 ---@class treble.raw.alsa
 ---@field open fun(sampleRate: number, channels: number, device: string?): treble.OutputStream?, string?
@@ -63,16 +75,17 @@ local DelayPointer = ffi.typeof("snd_pcm_sframes_t[1]")
 ---@field sampleRate number
 ---@field channels number
 ---@field private pcm treble.ffi.pcm
+---@field private library ffi.namespace*
 local Stream = {}
 Stream.__index = Stream
 
 --- Frames the device can take right now. An underrun leaves the stream in a
 --- state that takes no writes, so it is prepared again here.
 function Stream:avail()
-	local frames = asound.snd_pcm_avail_update(self.pcm)
+	local frames = self.library.snd_pcm_avail_update(self.pcm)
 	if frames < 0 then
-		asound.snd_pcm_prepare(self.pcm)
-		frames = asound.snd_pcm_avail_update(self.pcm)
+		self.library.snd_pcm_prepare(self.pcm)
+		frames = self.library.snd_pcm_avail_update(self.pcm)
 	end
 
 	return frames > 0 and tonumber(frames) or 0
@@ -81,16 +94,16 @@ end
 ---@param samples ffi.cdata*
 ---@param frames number
 function Stream:write(samples, frames)
-	local written = asound.snd_pcm_writei(self.pcm, samples, frames)
+	local written = self.library.snd_pcm_writei(self.pcm, samples, frames)
 
 	if written < 0 then
 		-- An underrun (EPIPE) or a suspended device must not end playback: put the
 		-- stream back in a writable state and try the same frames again.
-		if asound.snd_pcm_prepare(self.pcm) < 0 then
+		if self.library.snd_pcm_prepare(self.pcm) < 0 then
 			return 0
 		end
 
-		written = asound.snd_pcm_writei(self.pcm, samples, frames)
+		written = self.library.snd_pcm_writei(self.pcm, samples, frames)
 		if written < 0 then
 			return 0
 		end
@@ -107,13 +120,13 @@ end
 --- partly queued while the state sits at PREPARED. Only a running or draining
 --- stream can be trusted to answer.
 function Stream:delay()
-	local state = asound.snd_pcm_state(self.pcm)
+	local state = self.library.snd_pcm_state(self.pcm)
 	if state ~= SND_PCM_STATE_RUNNING and state ~= SND_PCM_STATE_DRAINING then
 		return 0
 	end
 
 	local delay = DelayPointer()
-	if asound.snd_pcm_delay(self.pcm, delay) < 0 then
+	if self.library.snd_pcm_delay(self.pcm, delay) < 0 then
 		return 0
 	end
 
@@ -123,23 +136,23 @@ end
 --- Plays out what the device holds and then leaves it idle. This is what keeps the
 --- tail of a short track from being dropped when nothing follows it.
 function Stream:drain()
-	asound.snd_pcm_drain(self.pcm)
+	self.library.snd_pcm_drain(self.pcm)
 end
 
 ---@param isPaused boolean
 function Stream:setPaused(isPaused)
-	asound.snd_pcm_pause(self.pcm, isPaused and 1 or 0)
+	self.library.snd_pcm_pause(self.pcm, isPaused and 1 or 0)
 end
 
 --- Throws away what the device still holds, which is what a seek needs.
 function Stream:flush()
-	asound.snd_pcm_drop(self.pcm)
-	asound.snd_pcm_prepare(self.pcm)
+	self.library.snd_pcm_drop(self.pcm)
+	self.library.snd_pcm_prepare(self.pcm)
 end
 
 function Stream:close()
 	if self.pcm ~= nil then
-		asound.snd_pcm_close(self.pcm)
+		self.library.snd_pcm_close(self.pcm)
 		self.pcm = nil
 	end
 end
@@ -150,17 +163,22 @@ end
 ---@return treble.raw.alsa.Stream? stream
 ---@return string? err
 function alsa.open(sampleRate, channels, device)
+	local lib = asound
+	if lib == nil then
+		return nil, "ALSA is not available on this system"
+	end
+
 	local handle = PcmHandle()
-	local err = asound.snd_pcm_open(handle, device or DEVICE, SND_PCM_STREAM_PLAYBACK, SND_PCM_BLOCKING)
+	local err = lib.snd_pcm_open(handle, device or DEVICE, SND_PCM_STREAM_PLAYBACK, SND_PCM_BLOCKING)
 	if err < 0 then
-		return nil, "Failed to open the PCM device: " .. ffi.string(asound.snd_strerror(err))
+		return nil, "Failed to open the PCM device: " .. ffi.string(lib.snd_strerror(err))
 	end
 
 	---@type treble.ffi.pcm
 	local pcm = handle[0]
 
 	-- Soft resampling lets one device follow whatever rate a track uses.
-	err = asound.snd_pcm_set_params(
+	err = lib.snd_pcm_set_params(
 		pcm,
 		SND_PCM_FORMAT_S16_LE,
 		SND_PCM_ACCESS_RW_INTERLEAVED,
@@ -170,11 +188,11 @@ function alsa.open(sampleRate, channels, device)
 		DEVICE_LATENCY_US
 	)
 	if err < 0 then
-		asound.snd_pcm_close(pcm)
-		return nil, "Failed to set the PCM parameters: " .. ffi.string(asound.snd_strerror(err))
+		lib.snd_pcm_close(pcm)
+		return nil, "Failed to set the PCM parameters: " .. ffi.string(lib.snd_strerror(err))
 	end
 
-	local stream = setmetatable({ pcm = pcm, sampleRate = sampleRate, channels = channels }, Stream)
+	local stream = setmetatable({ pcm = pcm, library = lib, sampleRate = sampleRate, channels = channels }, Stream)
 	return stream
 end
 

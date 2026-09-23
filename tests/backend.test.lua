@@ -10,6 +10,28 @@ local Wav = require("treble.formats.wav")
 
 local Samples = ffi.typeof("int16_t[?]")
 local Int16 = ffi.typeof("int16_t[1]")
+-- A machine with no ALSA at all, such as Android, or one without a null device,
+-- cannot run the tests that drive a real stream.
+local canUseDevice = (function()
+	if jit.os ~= "Linux" then
+		return false
+	end
+
+	local loaded, output = pcall(require, "treble.output")
+	if not loaded then
+		return false
+	end
+
+	local stream = output.open(44100, 1, "null")
+	if stream == nil then
+		return false
+	end
+
+	stream:close()
+
+	return true
+end)()
+
 local held = {}
 
 ---@param frames number
@@ -27,7 +49,7 @@ local function ramp(frames)
 	return assert(Wav.fromMemory(ffi.cast("const char*", content:ref()), #content))
 end
 
-test.skipIf(jit.os ~= "Linux")("plays a track through the real backend", function()
+test.skipIf(not canUseDevice)("plays a track through the real backend", function()
 	local player = Player.new({ device = "null" })
 
 	local errors = {}
@@ -109,7 +131,7 @@ test.skipIf(jit.os ~= "OSX")("opens the output unit and takes a whole track", fu
 	player:stop()
 end)
 
-test.skipIf(jit.os ~= "Linux")("seeks and resumes through the real backend", function()
+test.skipIf(not canUseDevice)("seeks and resumes through the real backend", function()
 	local player = Player.new({ device = "null" })
 
 	local errors = {}
