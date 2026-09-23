@@ -32,6 +32,29 @@ local canUseDevice = (function()
 	return true
 end)()
 
+-- Nor can Windows without a render endpoint, which a build machine usually has
+-- none of. The reason is printed so a log says what the machine reported.
+local canUseEndpoint = (function()
+	if jit.os ~= "Windows" then
+		return false
+	end
+
+	local loaded, output = pcall(require, "treble.output")
+	if not loaded then
+		return false
+	end
+
+	local stream, err = output.open(44100, 1)
+	if stream == nil then
+		print("skipping the backend tests: " .. tostring(err))
+		return false
+	end
+
+	stream:close()
+
+	return true
+end)()
+
 local held = {}
 
 ---@param frames number
@@ -75,7 +98,7 @@ test.skipIf(not canUseDevice)("plays a track through the real backend", function
 	player:stop()
 end)
 
-test.skipIf(jit.os ~= "Windows")("plays a track through the real backend", function()
+test.skipIf(not canUseEndpoint)("plays a track through the real backend", function()
 	local player = Player.new()
 
 	local errors = {}
