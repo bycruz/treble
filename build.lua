@@ -8,7 +8,7 @@ local build = require("lde-build")
 local bit = require("bit")
 
 -- Bump when the recipe changes in a way the cache key cannot see.
-local RECIPE_VERSION = 7
+local RECIPE_VERSION = 8
 
 local DR_MP3_VERSION = "mp3-0.7.3"
 local DR_FLAC_VERSION = "flac-0.13.3"
@@ -20,6 +20,10 @@ local CACHE_DIR = "../treble-native"
 local CACHE_NAME = "treble"
 
 local isWindows = jit.os == "Windows"
+-- Windows has two toolchains in the wild: mingw, whose linker is GNU ld, and the
+-- clang that targets MSVC, which hands its arguments to lld-link or link.exe and
+-- rejects both -fPIC and the GNU linker options.
+local isMsvc = build.target:find("msvc") ~= nil
 local isMac = jit.os == "OSX"
 local libraryName = isWindows and "decoders.dll" or "decoders.so"
 
@@ -162,7 +166,6 @@ local function writeOggConfig(oggDir)
 #define __CONFIG_TYPES_H__
 #include <inttypes.h>
 #include <stdint.h>
-#include <sys/types.h>
 typedef int16_t ogg_int16_t;
 typedef uint16_t ogg_uint16_t;
 typedef int32_t ogg_int32_t;
@@ -202,6 +205,48 @@ local function sourceList(path, names)
 	return sources
 end
 
+-- What Lua calls through ffi.load. An MSVC linked DLL exports nothing on its own,
+-- and its linker takes no wildcards, so the names are listed. Keeping this in step
+-- with the bindings is the same obligation the ELF version script has.
+local EXPORTED = {
+	"op_channel_count",
+	"op_free",
+	"op_open_file",
+	"op_open_memory",
+	"op_pcm_seek",
+	"op_pcm_total",
+	"op_read",
+	"op_seekable",
+	"op_tags",
+	"treble_flac_channels",
+	"treble_flac_close",
+	"treble_flac_comment_count",
+	"treble_flac_comment_size",
+	"treble_flac_comments",
+	"treble_flac_frame_count",
+	"treble_flac_open_file",
+	"treble_flac_open_memory",
+	"treble_flac_picture_data",
+	"treble_flac_picture_description",
+	"treble_flac_picture_mime",
+	"treble_flac_picture_size",
+	"treble_flac_read_s16",
+	"treble_flac_sample_rate",
+	"treble_flac_seek",
+	"treble_flac_vendor",
+	"treble_mp3_channels",
+	"treble_mp3_close",
+	"treble_mp3_frame_count",
+	"treble_mp3_open_file",
+	"treble_mp3_open_memory",
+	"treble_mp3_read_s16",
+	"treble_mp3_sample_rate",
+	"treble_mp3_seek",
+	"treble_mp3_tag_data",
+	"treble_mp3_tag_kind",
+	"treble_mp3_tag_size",
+}
+
 ---@type string[]
 local objects = {}
 
@@ -209,7 +254,13 @@ local objects = {}
 ---@param sources string[]
 ---@param flags string[]
 local function compile(sources, flags)
-	local args = { "-c", "-O2", "-fPIC", "-ffunction-sections", "-fdata-sections" }
+	local args = { "-c", "-O2", "-ffunction-sections", "-fdata-sections" }
+
+	-- Position independent code is only meaningful where the loader needs it, and
+	-- the MSVC target rejects the option outright.
+	if not isWindows then
+		args[#args + 1] = "-fPIC"
+	end
 
 	for _, flag in ipairs(flags) do
 		args[#args + 1] = flag
@@ -310,7 +361,21 @@ if isMac then
 	linkArgs[#linkArgs + 1] = "CoreFoundation"
 else
 	linkArgs[#linkArgs + 1] = "-shared"
-	linkArgs[#linkArgs + 1] = "-Wl,--gc-sections"
+
+	if isMsvc then
+		-- lld-link and link.exe spell dead code elimination this way, and they need
+		-- to be told what to export.
+		local definition = { "EXPORTS" }
+		for _, name in ipairs(EXPORTED) do
+			definition[#definition + 1] = name
+		end
+
+		build:write("exports.def", table.concat(definition, "\n") .. "\n")
+		linkArgs[#linkArgs + 1] = "-Wl,/OPT:REF"
+		linkArgs[#linkArgs + 1] = "-Wl,/DEF:exports.def"
+	else
+		linkArgs[#linkArgs + 1] = "-Wl,--gc-sections"
+	end
 
 	-- Windows fails on undefined symbols anyway; ELF hides them until a call
 	-- crashes, which would turn a missing source file into a runtime fault.
@@ -330,7 +395,10 @@ for _, object in ipairs(objects) do
 	linkArgs[#linkArgs + 1] = object
 end
 
-linkArgs[#linkArgs + 1] = "-lm"
+-- MSVC has no separate math library to link against.
+if not isWindows then
+	linkArgs[#linkArgs + 1] = "-lm"
+end
 
 build:cc(linkArgs)
 
